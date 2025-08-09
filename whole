@@ -904,7 +904,7 @@ export default function HybridSynthMVP() {
       </main>
 
       <footer className="p-4 text-xs text-neutral-400 border-t border-neutral-800 bg-neutral-950">
-        MVP build. Next steps: chord-detection plants, per-voice filter, presets, recording.
+        MVP build. Next steps: chord-detection plans, per-voice filter, presets, recording.
       </footer>
 
       {/* Styles */}
