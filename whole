@@ -1,0 +1,1057 @@
+import React, { useEffect, useRef, useState, useMemo } from "react";
+
+/**
+ * Hybrid Synth + Generative Engine + Canvas2D Visualizer (Fast MVP)
+ * UI: Hybrid-Industrial pass 1 (hardware-style sliders/buttons), analog screen kept separate.
+ * Fixes/patches included:
+ *  - Visualizer cleanup hook + window blur panic
+ *  - WAV recorder not routed to speakers (no doubling)
+ *  - MediaRecorder safe disconnect
+ *  - Filter Q clamped
+ *  - Preset select syncs name field
+ *  - Piano uses Pointer Events + pressed-key feedback
+ *  - On-screen octave indicator
+ *  - Controls grouped like an analog synth
+ */
+
+// ---------- Music theory helpers ----------
+const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+
+const SCALES = {
+  major: [0, 2, 4, 5, 7, 9, 11],
+  minor: [0, 2, 3, 5, 7, 8, 10],
+  dorian: [0, 2, 3, 5, 7, 9, 10],
+  mixolydian: [0, 2, 4, 5, 7, 9, 10],
+  pentatonicMinor: [0, 3, 5, 7, 10],
+  pentatonicMajor: [0, 2, 4, 7, 9],
+};
+
+function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
+function pitchClassHue(midi) { const pc = ((midi % 12) + 12) % 12; return (pc / 12) * 360; }
+
+// Map QWERTY keys to semitone steps from base MIDI
+const KEYMAP = {
+  a: 0, w: 1, s: 2, e: 3, d: 4, f: 5, t: 6, g: 7, y: 8, h: 9, u: 10, j: 11, k: 12, o: 13, l: 14,
+  ";": 15, "[": 16, "]": 17,
+};
+// Layout-independent mapping using KeyboardEvent.code (handles Intl layouts / Windows quirks)
+const CODEMAP = {
+  KeyA: 0, KeyW: 1, KeyS: 2, KeyE: 3, KeyD: 4, KeyF: 5, KeyT: 6, KeyG: 7, KeyY: 8, KeyH: 9, KeyU: 10, KeyJ: 11, KeyK: 12,
+  KeyO: 13, KeyL: 14, Semicolon: 15, BracketLeft: 16, BracketRight: 17,
+};
+
+export default function HybridSynthMVP() {
+  // Audio graph refs
+  const audioCtxRef = useRef(null);
+  const masterGainRef = useRef(null);
+  const analyserRef = useRef(null);
+  const filterRef = useRef(null);
+  const delayRef = useRef(null);
+  const delayGainRef = useRef(null);
+  const reverbRef = useRef(null);
+  const reverbGainRef = useRef(null);
+  const preFXGainRef = useRef(null); // voices feed into this
+
+  // Visuals
+  const canvasRef = useRef(null);
+  const rafRef = useRef(null);
+  const visualsCleanupRef = useRef(null);
+
+  // Poly voices & bookkeeping
+  const voicesRef = useRef(new Map()); // id -> { osc, env, midi, velocity }
+  const keyDownIdsRef = useRef(new Map()); // qwertyKeyOrCode -> voiceId
+  const midiNoteIdsRef = useRef(new Map()); // midi -> Set<voiceId>
+  const nextIdRef = useRef(1);
+  const releaseTimeoutsRef = useRef(new Set());
+
+  // Generative engine
+  const genTimerRef = useRef(null);
+
+  // Event handler ref so we can remove it
+  const pointerHandlerRef = useRef(null);
+
+  // Recording
+  const mediaRecorderRef = useRef(null);
+  const recordingChunksRef = useRef([]);
+  const recordingDestRef = useRef(null);
+  const [isRecording, setIsRecording] = useState(false);
+  const [downloadUrl, setDownloadUrl] = useState("");
+  const [recordingFormat, setRecordingFormat] = useState("wav"); // 'wav' | 'webm'
+
+  // WAV recording via ScriptProcessor
+  const scriptProcessorRef = useRef(null);
+  const recBuffersRef = useRef({ left: [], right: [] });
+  const recLengthRef = useRef(0);
+
+  // Presets
+  const [presetName, setPresetName] = useState("");
+  const [presets, setPresets] = useState([]);
+
+  // UI state
+  const [started, setStarted] = useState(false);
+  const [armed, setArmed] = useState(false); // keyboard arm when canvas/background clicked
+  const [baseMidi, setBaseMidi] = useState(60); // C4
+  const [oscType, setOscType] = useState("sawtooth");
+  const [attack, setAttack] = useState(0.01);
+  const [decay, setDecay] = useState(0.1);
+  const [sustain, setSustain] = useState(0.6);
+  const [release, setRelease] = useState(0.25);
+  const [filterCutoff, setFilterCutoff] = useState(1200);
+  const [resonance, setResonance] = useState(0.2);
+  const [delayTime, setDelayTime] = useState(0.25); // seconds
+  const [delayMix, setDelayMix] = useState(0.2);
+  const [reverbMix, setReverbMix] = useState(0.15);
+  const [master, setMaster] = useState(0.6);
+  const [scaleName, setScaleName] = useState("pentatonicMinor");
+  const [generative, setGenerative] = useState(false);
+  const [bpm, setBpm] = useState(80);
+  const [lastNoteHue, setLastNoteHue] = useState(200);
+  const [debugKey, setDebugKey] = useState("");
+
+  // Derived
+  const scaleSteps = useMemo(() => SCALES[scaleName] || SCALES.pentatonicMinor, [scaleName]);
+  const maxVoices = 16;
+  const [octaveShift, setOctaveShift] = useState(0); // +/- in semitones (multiples of 12)
+
+  // ---------- Audio init ----------
+  const initAudio = async () => {
+    if (started) return;
+    const AudioContextCls = window.AudioContext || window.webkitAudioContext;
+    const ctx = new AudioContextCls({ latencyHint: "interactive" });
+
+    // Master
+    const masterGain = ctx.createGain();
+    masterGain.gain.value = master;
+
+    // Filter (global for MVP)
+    const filter = ctx.createBiquadFilter();
+    filter.type = "lowpass";
+
+    // Delay
+    const delay = ctx.createDelay(1.0);
+    delay.delayTime.value = delayTime;
+    const delayGain = ctx.createGain();
+
+    // Simple reverb-ish: convolver with short noise impulse (very basic)
+    const convolver = ctx.createConvolver();
+    convolver.buffer = makeImpulseResponse(ctx, 1.2, 2.5); // length, decay
+    const reverbGain = ctx.createGain();
+
+    // Analyser
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 2048;
+
+    // Pre-FX bus that all voices connect into (so sends work)
+    const preFXGain = ctx.createGain();
+
+    // Wire graph: voices -> preFX -> filter -> master -> analyser -> destination
+    preFXGain.connect(filter);
+    filter.connect(masterGain);
+    masterGain.connect(analyser);
+    analyser.connect(ctx.destination);
+
+    // Delay send/return
+    const delaySend = ctx.createGain();
+    delaySend.gain.value = 0.7;
+    preFXGain.connect(delaySend);
+    delaySend.connect(delay);
+    delay.connect(delayGain);
+    delayGain.connect(filter);
+
+    // Reverb send/return
+    const verbSend = ctx.createGain();
+    verbSend.gain.value = 0.7;
+    preFXGain.connect(verbSend);
+    verbSend.connect(convolver);
+    convolver.connect(reverbGain);
+    reverbGain.connect(filter);
+
+    // Save refs
+    audioCtxRef.current = ctx;
+    masterGainRef.current = masterGain;
+    analyserRef.current = analyser;
+    filterRef.current = filter;
+    delayRef.current = delay;
+    delayGainRef.current = delayGain;
+    reverbRef.current = convolver;
+    reverbGainRef.current = reverbGain;
+    preFXGainRef.current = preFXGain;
+
+    // Apply initial params
+    setFilterParams(filterCutoff, resonance);
+    setDelayParams(delayTime, delayMix);
+    setReverbParams(reverbMix);
+
+    // Start visual loop (store cleanup)
+    visualsCleanupRef.current = startVisuals();
+
+    setStarted(true);
+
+    // Keyboard listeners (bubble phase)
+    document.addEventListener("keydown", onKeyDown, false);
+    document.addEventListener("keyup", onKeyUp, false);
+
+    // Pointer focus helper (store handler to remove later)
+    pointerHandlerRef.current = () => {
+      try { window.focus(); canvasRef.current?.focus(); } catch {}
+    };
+    document.addEventListener("pointerdown", pointerHandlerRef.current, { passive: true });
+
+    window.addEventListener("visibilitychange", onVisibility, false);
+    window.addEventListener("blur", panicAll, false); // kill stuck notes on blur
+
+    // Try Web MIDI (optional)
+    if (navigator.requestMIDIAccess) {
+      try {
+        const access = await navigator.requestMIDIAccess();
+        for (const input of access.inputs.values()) {
+          input.onmidimessage = onMIDIMessage;
+        }
+      } catch {}
+    }
+  };
+
+  useEffect(() => {
+    // Load presets on mount
+    const loaded = loadPresetsFromStorage();
+    setPresets(loaded);
+
+    runSelfTests();
+
+    return () => {
+      // Cleanup
+      cancelAnimationFrame(rafRef.current);
+      if (visualsCleanupRef.current) { try { visualsCleanupRef.current(); } catch {} }
+      document.removeEventListener("keydown", onKeyDown, false);
+      document.removeEventListener("keyup", onKeyUp, false);
+      if (pointerHandlerRef.current) document.removeEventListener("pointerdown", pointerHandlerRef.current);
+      window.removeEventListener("visibilitychange", onVisibility, false);
+      window.removeEventListener("blur", panicAll, false);
+      if (genTimerRef.current) clearInterval(genTimerRef.current);
+      for (const to of releaseTimeoutsRef.current) clearTimeout(to);
+      if (audioCtxRef.current) {
+        try { audioCtxRef.current.close(); } catch {}
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ---------- Recording ----------
+  function startRecording() {
+    const ctx = audioCtxRef.current;
+    if (!ctx || !masterGainRef.current) return;
+    try { if (downloadUrl) { URL.revokeObjectURL(downloadUrl); setDownloadUrl(""); } } catch {}
+
+    if (recordingFormat === 'webm' && typeof MediaRecorder !== 'undefined') {
+      // WebM path (lossy, small)
+      recordingDestRef.current = ctx.createMediaStreamDestination();
+      masterGainRef.current.connect(recordingDestRef.current);
+      const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm';
+      const mr = new MediaRecorder(recordingDestRef.current.stream, { mimeType: mime });
+      recordingChunksRef.current = [];
+      mr.ondataavailable = (e) => { if (e.data && e.data.size) recordingChunksRef.current.push(e.data); };
+      mr.onstop = () => {
+        const blob = new Blob(recordingChunksRef.current, { type: mime });
+        const url = URL.createObjectURL(blob);
+        setDownloadUrl(url);
+        setIsRecording(false);
+        if (recordingDestRef.current && masterGainRef.current) {
+          try { masterGainRef.current.disconnect(recordingDestRef.current); } catch {}
+        }
+        recordingDestRef.current = null;
+        autoDownload(url, `hybrid-synth-${Date.now()}.webm`);
+      };
+      mediaRecorderRef.current = mr;
+      mr.start();
+      setIsRecording(true);
+    } else {
+      // WAV path (lossless)
+      const bufferSize = 4096;
+      const sp = ctx.createScriptProcessor(bufferSize, 2, 2);
+      recBuffersRef.current = { left: [], right: [] };
+      recLengthRef.current = 0;
+      sp.onaudioprocess = (e) => {
+        const inL = e.inputBuffer.getChannelData(0);
+        const inR = e.inputBuffer.numberOfChannels > 1 ? e.inputBuffer.getChannelData(1) : inL;
+        recBuffersRef.current.left.push(new Float32Array(inL));
+        recBuffersRef.current.right.push(new Float32Array(inR));
+        recLengthRef.current += inL.length;
+      };
+      scriptProcessorRef.current = sp;
+      try { masterGainRef.current.connect(sp); } catch {}
+      // IMPORTANT: do NOT route the ScriptProcessor to speakers (prevents doubling/latency)
+      setIsRecording(true);
+    }
+  }
+
+  function stopRecording() {
+    if (!isRecording) return;
+    if (recordingFormat === 'webm' && mediaRecorderRef.current) {
+      try { mediaRecorderRef.current.stop(); } catch {}
+      return;
+    }
+    // WAV finalize
+    const ctx = audioCtxRef.current;
+    try { masterGainRef.current.disconnect(scriptProcessorRef.current); } catch {}
+    try { scriptProcessorRef.current.disconnect(ctx.destination); } catch {}
+    const { left, right } = recBuffersRef.current;
+    const length = recLengthRef.current;
+    const wavBlob = encodeWAV(left, right, length, ctx.sampleRate);
+    const url = URL.createObjectURL(wavBlob);
+    setDownloadUrl(url);
+    setIsRecording(false);
+    autoDownload(url, `hybrid-synth-${Date.now()}.wav`);
+  }
+
+  function autoDownload(url, filename) {
+    try {
+      const a = document.createElement('a');
+      a.href = url; a.download = filename; a.style.display = 'none';
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    } catch {}
+  }
+
+  function encodeWAV(buffersL, buffersR, totalLength, sampleRate) {
+    // Merge buffers
+    const dataL = mergeBuffers(buffersL, totalLength);
+    const dataR = mergeBuffers(buffersR, totalLength);
+    // Interleave
+    const interleaved = interleave(dataL, dataR);
+    // Encode PCM16 WAV
+    const wavBuffer = writeWAV(interleaved, sampleRate, 2, 16);
+    return new Blob([wavBuffer], { type: 'audio/wav' });
+  }
+  function mergeBuffers(buffers, totalLength) {
+    const result = new Float32Array(totalLength);
+    let offset = 0;
+    for (let i = 0; i < buffers.length; i++) {
+      result.set(buffers[i], offset);
+      offset += buffers[i].length;
+    }
+    return result;
+  }
+  function interleave(left, right) {
+    const length = left.length + right.length;
+    const result = new Float32Array(length);
+    let iL = 0, iR = 0;
+    for (let i = 0; i < length; ) {
+      result[i++] = left[iL++];
+      result[i++] = right[iR++];
+    }
+    return result;
+  }
+  function writeString(view, offset, string) {
+    for (let i = 0; i < string.length; i++) view.setUint8(offset + i, string.charCodeAt(i));
+  }
+  function floatTo16BitPCM(output, offset, input) {
+    for (let i = 0; i < input.length; i++, offset += 2) {
+      let s = Math.max(-1, Math.min(1, input[i]));
+      s = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      output.setInt16(offset, s, true);
+    }
+  }
+  function writeWAV(samples, sampleRate, numChannels, bitDepth) {
+    const blockAlign = numChannels * (bitDepth / 8);
+    const byteRate = sampleRate * blockAlign;
+    const dataSize = samples.length * (bitDepth / 8);
+    const buffer = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(buffer);
+
+    writeString(view, 0, 'RIFF');
+    view.setUint32(4, 36 + dataSize, true);
+    writeString(view, 8, 'WAVE');
+    writeString(view, 12, 'fmt ');
+    view.setUint32(16, 16, true); // PCM chunk size
+    view.setUint16(20, 1, true); // PCM format
+    view.setUint16(22, numChannels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, byteRate, true);
+    view.setUint16(32, blockAlign, true);
+    view.setUint16(34, bitDepth, true);
+    writeString(view, 36, 'data');
+    view.setUint32(40, dataSize, true);
+
+    // PCM data
+    floatTo16BitPCM(view, 44, samples);
+    return view;
+  }
+
+  // ---------- Presets ----------
+  const STORAGE_KEY = 'hybridSynthPresetsV1';
+  function loadPresetsFromStorage() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        return JSON.parse(raw);
+      }
+    } catch {}
+    // seed defaults
+    const defaults = [
+      { name: 'Ambient Wash', data: { oscType:'sawtooth', attack:0.4, decay:0.6, sustain:0.7, release:1.2, filterCutoff:1800, resonance:0.15, delayTime:0.35, delayMix:0.35, reverbMix:0.4, master:0.6, scaleName:'pentatonicMajor', bpm:70, baseMidi:60 }},
+      { name: 'Pluck Echo', data: { oscType:'square', attack:0.005, decay:0.18, sustain:0.2, release:0.2, filterCutoff:2800, resonance:0.3, delayTime:0.25, delayMix:0.5, reverbMix:0.15, master:0.6, scaleName:'minor', bpm:90, baseMidi:62 }},
+      { name: 'Warm Triangle', data: { oscType:'triangle', attack:0.02, decay:0.3, sustain:0.6, release:0.6, filterCutoff:1600, resonance:0.1, delayTime:0.28, delayMix:0.2, reverbMix:0.25, master:0.6, scaleName:'dorian', bpm:84, baseMidi:57 }},
+      { name: 'Square Lead', data: { oscType:'square', attack:0.01, decay:0.12, sustain:0.8, release:0.25, filterCutoff:4200, resonance:0.2, delayTime:0.18, delayMix:0.18, reverbMix:0.1, master:0.65, scaleName:'mixolydian', bpm:108, baseMidi:64 }},
+    ];
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(defaults)); } catch {}
+    return defaults;
+  }
+  function savePresetsToStorage(list) {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(list)); } catch {}
+  }
+  function currentPresetData() {
+    return { oscType, attack, decay, sustain, release, filterCutoff, resonance, delayTime, delayMix, reverbMix, master, scaleName, bpm, baseMidi };
+  }
+  function applyPreset(p) {
+    if (!p) return;
+    setOscType(p.oscType);
+    setAttack(p.attack); setDecay(p.decay); setSustain(p.sustain); setRelease(p.release);
+    setFilterCutoff(p.filterCutoff); setResonance(p.resonance);
+    setDelayTime(p.delayTime); setDelayMix(p.delayMix); setReverbMix(p.reverbMix);
+    setMaster(p.master);
+    setScaleName(p.scaleName); setBpm(p.bpm); setBaseMidi(p.baseMidi);
+  }
+  function savePreset() {
+    const name = (presetName || '').trim(); if (!name) return;
+    const data = currentPresetData();
+    const next = presets.filter(pr => pr.name !== name).concat([{ name, data }]);
+    setPresets(next);
+    savePresetsToStorage(next);
+    // round-trip test
+    const back = (next.find(p=>p.name===name)||{}).data;
+    console.assert(JSON.stringify(back) === JSON.stringify(data), 'Preset round-trip failed');
+  }
+  function deletePreset(name) {
+    const next = presets.filter(p => p.name !== name);
+    setPresets(next);
+    savePresetsToStorage(next);
+  }
+
+  // ---------- Audio param setters ----------
+  function setFilterParams(cut, res) {
+    const ctx = audioCtxRef.current;
+    if (!ctx || !filterRef.current) return;
+    filterRef.current.frequency.setTargetAtTime(cut, ctx.currentTime, 0.01);
+    const q = Math.max(0.001, Math.min(18, res * 20)); // clamped Q
+    filterRef.current.Q.setTargetAtTime(q, ctx.currentTime, 0.01);
+  }
+
+  function setDelayParams(time, mix) {
+    if (!audioCtxRef.current || !delayRef.current || !delayGainRef.current) return;
+    delayRef.current.delayTime.value = time;
+    delayGainRef.current.gain.setTargetAtTime(Math.min(0.9, Math.max(0, mix)), audioCtxRef.current.currentTime, 0.01);
+  }
+
+  function setReverbParams(mix) {
+    if (!audioCtxRef.current || !reverbGainRef.current) return;
+    reverbGainRef.current.gain.setTargetAtTime(Math.min(0.9, Math.max(0, mix)), audioCtxRef.current.currentTime, 0.01);
+  }
+
+  useEffect(() => {
+    if (masterGainRef.current && audioCtxRef.current) {
+      masterGainRef.current.gain.setTargetAtTime(master, audioCtxRef.current.currentTime, 0.01);
+    }
+  }, [master]);
+
+  useEffect(() => setFilterParams(filterCutoff, resonance), [filterCutoff, resonance]);
+  useEffect(() => setDelayParams(delayTime, delayMix), [delayTime, delayMix]);
+  useEffect(() => setReverbParams(reverbMix), [reverbMix]);
+  // live sustain update for currently held notes
+  useEffect(() => {
+    const ctx = audioCtxRef.current; if (!ctx) return;
+    voicesRef.current.forEach(v => {
+      const target = Math.max(0.001, v.velocity * sustain);
+      try { v.env.gain.setTargetAtTime(target, ctx.currentTime, 0.03); } catch {}
+    });
+  }, [sustain]);
+
+  // ---------- Voice handling ----------
+  function triggerNote(midi, velocity = 0.8) {
+    const ctx = audioCtxRef.current;
+    if (!ctx || !preFXGainRef.current) return null;
+
+    // voice cap to avoid runaway loudness
+    if (voicesRef.current.size >= maxVoices) {
+      // steal the oldest voice
+      const oldestId = [...voicesRef.current.keys()][0];
+      releaseVoiceById(oldestId);
+    }
+
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    osc.type = oscType;
+    osc.frequency.value = midiToFreq(midi);
+
+    const env = ctx.createGain();
+    env.gain.value = 0.0001;
+
+    // route: osc -> env -> preFX bus
+    osc.connect(env);
+    env.connect(preFXGainRef.current);
+
+    // ADSR
+    env.gain.cancelScheduledValues(now);
+    env.gain.setValueAtTime(0.0001, now);
+    env.gain.exponentialRampToValueAtTime(Math.max(0.001, velocity), now + Math.max(0.001, attack));
+    env.gain.exponentialRampToValueAtTime(Math.max(0.001, velocity * sustain), now + Math.max(0.001, attack + decay));
+
+    osc.start(now);
+
+    const id = `v${nextIdRef.current++}`;
+    voicesRef.current.set(id, { osc, env, midi, velocity });
+
+    // index by midi for MIDI note-off convenience
+    const setForMidi = midiNoteIdsRef.current.get(midi) || new Set();
+    setForMidi.add(id);
+    midiNoteIdsRef.current.set(midi, setForMidi);
+
+    setLastNoteHue(pitchClassHue(midi));
+    return id;
+  }
+
+  function releaseVoiceById(id) {
+    const ctx = audioCtxRef.current;
+    if (!ctx) return;
+    const v = voicesRef.current.get(id);
+    if (!v) return;
+    const now = ctx.currentTime;
+    const { osc, env, midi } = v;
+
+    env.gain.cancelScheduledValues(now);
+    env.gain.setTargetAtTime(0.0001, now, Math.max(0.01, release));
+    try { osc.stop(now + Math.max(0.05, release * 2)); } catch {}
+
+    setTimeout(() => {
+      try { osc.disconnect(); } catch {}
+      try { env.disconnect(); } catch {}
+    }, (Math.max(0.05, release * 2) + 0.1) * 1000);
+
+    voicesRef.current.delete(id);
+    const setForMidi = midiNoteIdsRef.current.get(midi);
+    if (setForMidi) { setForMidi.delete(id); if (setForMidi.size === 0) midiNoteIdsRef.current.delete(midi); }
+  }
+
+  function panicAll() {
+    for (const id of [...voicesRef.current.keys()]) releaseVoiceById(id);
+    for (const to of releaseTimeoutsRef.current) clearTimeout(to);
+    releaseTimeoutsRef.current.clear();
+  }
+
+  // ---------- Keyboard & MIDI ----------
+  function onKeyDown(e) {
+    if (!started) return;
+    try { audioCtxRef.current?.resume(); } catch {}
+    const tag = (e.target && e.target.tagName) ? e.target.tagName.toLowerCase() : "";
+    if (["input", "textarea", "select"].includes(tag)) return;
+    if (!armed) return;
+    if (e.repeat) return;
+
+    const key = (e.key || "").toLowerCase();
+    const code = e.code || "";
+    setDebugKey(`${code}/${key}`);
+    // Octave shifting with Z/X by code as well
+    if (key === 'z' || code === 'KeyZ') { e.preventDefault(); setOctaveShift(s => Math.max(-24, s - 12)); return; }
+    if (key === 'x' || code === 'KeyX') { e.preventDefault(); setOctaveShift(s => Math.min(24, s + 12)); return; }
+
+    const semitone = (code in CODEMAP) ? CODEMAP[code] : (key in KEYMAP ? KEYMAP[key] : null);
+    const mapKey = code || key;
+    if (semitone !== null && semitone !== undefined && !keyDownIdsRef.current.get(mapKey)) {
+      e.preventDefault();
+      const midi = baseMidi + octaveShift + semitone;
+      const id = triggerNote(midi, 0.9);
+      if (id) keyDownIdsRef.current.set(mapKey, id);
+    }
+  }
+
+  function onKeyUp(e) {
+    if (!started) return;
+    const tag = (e.target && e.target.tagName) ? e.target.tagName.toLowerCase() : "";
+    if (["input", "textarea", "select"].includes(tag)) return;
+    if (!armed) return;
+
+    const key = (e.key || "").toLowerCase();
+    const code = e.code || "";
+    if (key === 'z' || key === 'x' || code === 'KeyZ' || code === 'KeyX') return;
+    const mapKey = code || key;
+    const id = keyDownIdsRef.current.get(mapKey);
+    if (id) {
+      e.preventDefault();
+      releaseVoiceById(id);
+      keyDownIdsRef.current.delete(mapKey);
+    }
+  }
+
+  function onMIDIMessage(msg) {
+    const [status, d1, d2] = msg.data;
+    const cmd = status & 0xf0;
+    const isNoteOn = cmd === 0x90 && d2 > 0;
+    const isNoteOff = cmd === 0x80 || (cmd === 0x90 && d2 === 0);
+    if (isNoteOn) triggerNote(d1, Math.max(0.2, d2 / 127));
+    if (isNoteOff) {
+      const setForMidi = midiNoteIdsRef.current.get(d1);
+      if (setForMidi && setForMidi.size) {
+        const id = Array.from(setForMidi).pop();
+        releaseVoiceById(id);
+      }
+    }
+  }
+
+  function onVisibility() {
+    const ctx = audioCtxRef.current;
+    if (document.visibilityState === 'visible' && ctx && ctx.state !== 'running') {
+      try { ctx.resume(); } catch {}
+    }
+  }
+
+  // ---------- Generative Engine ----------
+  useEffect(() => {
+    if (!started) return;
+
+    if (genTimerRef.current) { clearInterval(genTimerRef.current); genTimerRef.current = null; }
+
+    if (generative) {
+      const sixteenthMs = Math.max(20, (60_000 / Math.max(20, bpm)) / 4);
+      genTimerRef.current = setInterval(() => generativeTick(), sixteenthMs);
+    }
+
+    return () => { if (genTimerRef.current) { clearInterval(genTimerRef.current); genTimerRef.current = null; } };
+  }, [generative, started, bpm, scaleSteps, baseMidi]);
+
+  function generativeTick() {
+    const ctx = audioCtxRef.current;
+    if (!ctx) return;
+
+    const step = scaleSteps[Math.floor(Math.random() * scaleSteps.length)];
+    const octaveOffset = (Math.random() < 0.7 ? 0 : (Math.random() < 0.5 ? -12 : 12));
+    const midi = baseMidi + step + octaveOffset;
+
+    const vel = 0.35 + Math.random() * 0.3;
+    const id = triggerNote(midi, vel);
+
+    const spb = 60 / Math.max(20, bpm);
+    const hold = spb * (0.3 + Math.random() * 0.9);
+    const to = setTimeout(() => {
+      if (id) releaseVoiceById(id);
+      releaseTimeoutsRef.current.delete(to);
+    }, hold * 1000);
+    releaseTimeoutsRef.current.add(to);
+  }
+
+  // ---------- Visuals (Canvas2D) ----------
+  function startVisuals() {
+    const canvas = canvasRef.current;
+    const analyser = analyserRef.current;
+    if (!canvas || !analyser) return () => {};
+
+    const ctx2d = canvas.getContext("2d");
+    const width = () => canvas.clientWidth;
+    const height = () => canvas.clientHeight;
+
+    function resize() {
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.floor(width() * dpr);
+      canvas.height = Math.floor(height() * dpr);
+      ctx2d.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    resize();
+    window.addEventListener("resize", resize);
+
+    const bufferLength = analyser.fftSize;
+    const dataArray = new Uint8Array(bufferLength);
+    const freqArray = new Uint8Array(analyser.frequencyBinCount);
+
+    const render = () => {
+      const w = width();
+      const h = height();
+
+      const hue = 200 + (filterCutoff / 20000) * 140; // approx 200..340
+      const bg = ctx2d.createLinearGradient(0, 0, 0, h);
+      bg.addColorStop(0, `hsl(${hue}, 45%, 12%)`);
+      bg.addColorStop(1, `hsl(${(hue + 40) % 360}, 55%, 8%)`);
+      ctx2d.fillStyle = bg;
+      ctx2d.fillRect(0, 0, w, h);
+
+      analyser.getByteTimeDomainData(dataArray);
+      analyser.getByteFrequencyData(freqArray);
+
+      const lowBins = Math.max(4, Math.floor(freqArray.length * 0.08));
+      let lowEnergy = 0;
+      for (let i = 0; i < lowBins; i++) lowEnergy += freqArray[i];
+      lowEnergy /= (lowBins * 255);
+
+      ctx2d.beginPath();
+      ctx2d.moveTo(0, h * 0.7);
+      for (let x = 0; x < w; x += 6) {
+        const idx = Math.floor((x / w) * bufferLength);
+        const v = dataArray[idx] / 255; // 0..1
+        const y = h * 0.7 + (v - 0.5) * 60 * (0.6 + lowEnergy * 1.8);
+        ctx2d.lineTo(x, y);
+      }
+      ctx2d.lineTo(w, h);
+      ctx2d.lineTo(0, h);
+      ctx2d.closePath();
+      ctx2d.fillStyle = `hsla(${(hue + 300) % 360}, 45%, 20%, 0.6)`;
+      ctx2d.fill();
+
+      ctx2d.beginPath();
+      for (let i = 0; i < bufferLength; i++) {
+        const x = (i / (bufferLength - 1)) * w;
+        const v = dataArray[i] / 128.0 - 1.0; // -1..1
+        const y = h * 0.35 + v * 60;
+        if (i === 0) ctx2d.moveTo(x, y); else ctx2d.lineTo(x, y);
+      }
+      ctx2d.strokeStyle = `hsla(${lastNoteHue}, 80%, 70%, 0.9)`;
+      ctx2d.lineWidth = 2;
+      ctx2d.stroke();
+
+      const highStart = Math.floor(freqArray.length * 0.5);
+      let highEnergy = 0;
+      const n = freqArray.length - highStart;
+      for (let i = highStart; i < freqArray.length; i++) highEnergy += freqArray[i];
+      highEnergy /= (n * 255);
+      const sparks = Math.floor(highEnergy * 80);
+      ctx2d.fillStyle = `hsla(${(lastNoteHue + 40) % 360}, 90%, 70%, 0.8)`;
+      for (let i = 0; i < sparks; i++) {
+        const x = Math.random() * w;
+        const y = Math.random() * h * 0.5;
+        ctx2d.fillRect(x, y, 2, 2);
+      }
+
+      rafRef.current = requestAnimationFrame(render);
+    };
+
+    rafRef.current = requestAnimationFrame(render);
+
+    return () => {
+      window.removeEventListener("resize", resize);
+      cancelAnimationFrame(rafRef.current);
+    };
+  }
+
+  // ---------- Simple impulse response for faux reverb ----------
+  function makeImpulseResponse(ctx, duration = 1.5, decay = 2.0) {
+    const rate = ctx.sampleRate;
+    const length = Math.floor(rate * duration);
+    const impulse = ctx.createBuffer(2, length, rate);
+    for (let ch = 0; ch < 2; ch++) {
+      const channel = impulse.getChannelData(ch);
+      for (let i = 0; i < length; i++) {
+        channel[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / length, decay);
+      }
+    }
+    return impulse;
+  }
+
+  // ---------- UI Styles (Hybrid Industrial) ----------
+  const ACCENT = '#ff6a00'; // TE-style orange
+
+  // ---------- UI ----------
+  return (
+    <div className="min-h-screen bg-neutral-900 text-neutral-100 flex flex-col" onClick={() => setArmed(true)}>
+      <header className="p-4 flex items-center justify-between gap-4 border-b border-neutral-800 bg-gradient-to-b from-neutral-900 to-neutral-950">
+        <h1 className="text-xl font-semibold">Hybrid Synth + Visuals (MVP)</h1>
+        <div className="flex items-center gap-2">
+          {!started ? (
+            <button
+              onClick={initAudio}
+              className="px-4 py-2 bg-emerald-500 hover:bg-emerald-600 rounded-xl font-medium"
+            >
+              Start Audio
+            </button>
+          ) : (
+            <>
+              <span className="text-emerald-400 text-sm">Audio running ✓</span>
+              <button onClick={panicAll} className="px-3 py-2 bg-rose-600 hover:bg-rose-700 rounded-lg text-xs font-semibold">PANIC</button>
+              <button onClick={() => { setArmed(a=>!a); try { canvasRef.current?.focus(); } catch {}; }} className={`px-3 py-2 rounded-lg text-xs font-semibold ${armed?"bg-indigo-500 hover:bg-indigo-600":"bg-neutral-700 hover:bg-neutral-600"}`}>{armed?"Keys Captured":"Capture Keys"}</button>
+
+              {/* Record controls */}
+              <select value={recordingFormat} onChange={e=>setRecordingFormat(e.target.value)} className="px-2 py-2 bg-neutral-800 rounded-lg text-xs">
+                <option value="wav">WAV (lossless)</option>
+                <option value="webm">WebM/Opus (small)</option>
+              </select>
+              {!isRecording ? (
+                <button onClick={startRecording} className="px-3 py-2 bg-yellow-500 hover:bg-yellow-600 rounded-lg text-xs font-semibold">● Tape</button>
+              ) : (
+                <button onClick={stopRecording} className="px-3 py-2 bg-yellow-700 hover:bg-yellow-800 rounded-lg text-xs font-semibold">■ Stop</button>
+              )}
+              {downloadUrl && (
+                <a href={downloadUrl} download={`hybrid-synth-${Date.now()}.${recordingFormat==='wav'?'wav':'webm'}`} className="px-3 py-2 bg-neutral-700 hover:bg-neutral-600 rounded-lg text-xs font-semibold">Download take</a>
+              )}
+            </>
+          )}
+        </div>
+      </header>
+
+      <main className="grid grid-cols-1 xl:grid-cols-[1.1fr_1fr] gap-6 p-6 grow bg-neutral-950">
+        {/* Visualizer */}
+        <section className="relative rounded-[18px] border border-neutral-800 bg-neutral-900 shadow-[inset_0_0_60px_rgba(0,0,0,0.6)]">
+          {/* Analog screen bezel */}
+          <div className="absolute inset-0 rounded-[18px] pointer-events-none" style={{boxShadow:'inset 0 2px 0 rgba(255,255,255,0.06), inset 0 -2px 0 rgba(0,0,0,0.6)'}} />
+          <div className="relative m-4 rounded-[12px] overflow-hidden border border-neutral-800 bg-black">
+            <canvas ref={canvasRef} tabIndex={0} className="w-full h-[360px] md:h-[460px] lg:h-[560px] block outline-none" onClick={() => { setArmed(true); try { canvasRef.current?.focus(); } catch {} }} />
+            {/* glass glare */}
+            <div className="pointer-events-none absolute inset-0" style={{background:'linear-gradient(180deg, rgba(255,255,255,0.06) 0%, rgba(255,255,255,0) 25%)'}} />
+            {/* scanlines */}
+            <div className="pointer-events-none absolute inset-0 opacity-25 mix-blend-soft-light" style={{background:'repeating-linear-gradient( to bottom, rgba(255,255,255,0.05) 0, rgba(255,255,255,0.05) 1px, transparent 1px, transparent 3px)'}} />
+            {/* status badge */}
+            <div className="absolute bottom-3 right-3 text-xs px-2 py-1 bg-black/50 rounded-md border border-neutral-800">
+              {armed ? "Keys armed: AWSEDFT GYHUJK" : "Click here or 'Capture Keys' to arm keyboard"}
+              {debugKey && <div className="mt-1 opacity-70">last key: {debugKey}</div>}
+            </div>
+          </div>
+          {/* corner screws */}
+          {['top-2 left-2','top-2 right-2','bottom-2 left-2','bottom-2 right-2'].map(pos => (
+            <div key={pos} className={`absolute ${pos} w-2 h-2 rounded-full bg-neutral-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.3)]`} />
+          ))}
+        </section>
+
+        {/* Controls */}
+        <section className="panel rounded-[18px] border border-neutral-800 p-4 bg-neutral-900/95 shadow-[inset_0_-8px_24px_rgba(0,0,0,0.5)] flex flex-col gap-6">
+          {/* On-screen Piano */}
+          <Piano baseMidi={baseMidi + octaveShift} onDown={(m)=>triggerNote(m,0.9)} onUp={(m)=>{ const setForMidi=midiNoteIdsRef.current.get(m); if(setForMidi&&setForMidi.size){const last=[...setForMidi].pop(); releaseVoiceById(last);} }} />
+
+          {/* Presets */}
+          <Group title="Presets">
+            <Control label="Preset name">
+              <input value={presetName} onChange={e=>setPresetName(e.target.value)} placeholder="My preset" className="hw-input w-full" />
+              <div className="flex gap-2 mt-2">
+                <button onClick={savePreset} className="btn">Save</button>
+                <select
+                  onChange={e=>{ const name=e.target.value; setPresetName(name); const p=presets.find(x=>x.name===name); if(p) applyPreset(p.data); }}
+                  className="hw-input"
+                >
+                  <option value="">Load…</option>
+                  {presets.map(p=> <option key={p.name} value={p.name}>{p.name}</option>)}
+                </select>
+                <button onClick={()=>{ if(!presetName) return; deletePreset(presetName); }} className="btn btn-ghost">Delete</button>
+              </div>
+            </Control>
+          </Group>
+
+          {/* Oscillator */}
+          <Group title="Oscillator">
+            <Control label="Oscillator">
+              <select value={oscType} onChange={e=>setOscType(e.target.value)} className="hw-input w-full">
+                <option value="sine">Sine</option>
+                <option value="triangle">Triangle</option>
+                <option value="square">Square</option>
+                <option value="sawtooth">Saw</option>
+              </select>
+            </Control>
+            <Control label="Base Note (MIDI)">
+              <input type="number" value={baseMidi} min={36} max={84}
+                     onChange={e=>setBaseMidi(parseInt(e.target.value||"60"))}
+                     className="hw-input w-full" />
+              <div className="text-[10px] text-neutral-400 mt-1">MIDI: {baseMidi} ({NOTE_NAMES[baseMidi%12]}{Math.floor(baseMidi/12)-1})</div>
+            </Control>
+          </Group>
+
+          {/* Envelope (ADSR) */}
+          <Group title="Envelope (ADSR)">
+            <Slider label="Attack" value={attack} min={0.001} max={1.0} step={0.001} onChange={setAttack} />
+            <Slider label="Decay" value={decay} min={0.01} max={2.0} step={0.01} onChange={setDecay} />
+            <Slider label="Sustain" value={sustain} min={0.0} max={1.0} step={0.01} onChange={setSustain} />
+            <Slider label="Release" value={release} min={0.01} max={2.0} step={0.01} onChange={setRelease} />
+          </Group>
+
+          {/* Filter */}
+          <Group title="Filter">
+            <Slider label="Cutoff" value={filterCutoff} min={100} max={8000} step={1} onChange={setFilterCutoff} />
+            <Slider label="Resonance" value={resonance} min={0.0} max={1.0} step={0.01} onChange={setResonance} />
+          </Group>
+
+          {/* Delay */}
+          <Group title="Delay">
+            <Slider label="Delay Time" value={delayTime} min={0.05} max={0.7} step={0.01} onChange={setDelayTime} />
+            <Slider label="Delay Mix" value={delayMix} min={0.0} max={0.9} step={0.01} onChange={setDelayMix} />
+          </Group>
+
+          {/* Reverb */}
+          <Group title="Reverb">
+            <Slider label="Reverb Mix" value={reverbMix} min={0.0} max={0.9} step={0.01} onChange={setReverbMix} />
+          </Group>
+
+          {/* Sequencing / Scale */}
+          <Group title="Sequencing & Scale">
+            <Control label="Scale">
+              <select value={scaleName} onChange={e=>setScaleName(e.target.value)} className="hw-input w-full">
+                {Object.keys(SCALES).map(k=> <option key={k} value={k}>{k}</option>)}
+              </select>
+            </Control>
+            <Control label="BPM">
+              <input type="number" value={bpm} min={20} max={200}
+                     onChange={e=>setBpm(parseInt(e.target.value||"80"))}
+                     className="hw-input w-full" />
+            </Control>
+            <Control label="Generative">
+              <button onClick={()=>setGenerative(v=>!v)} className={`px-3 py-2 rounded-lg font-medium ${generative?"bg-indigo-500 hover:bg-indigo-600":"bg-neutral-700 hover:bg-neutral-600"}`}>
+                {generative? "On" : "Off"}
+              </button>
+              <div className="text-[10px] text-neutral-400 mt-1">Random notes in the scale (16-voice cap)</div>
+            </Control>
+          </Group>
+
+          {/* Output */}
+          <Group title="Output">
+            <Slider label="Master" value={master} min={0.0} max={1.0} step={0.01} onChange={setMaster} />
+          </Group>
+
+          <div className="text-sm text-neutral-400 border-t border-neutral-800 pt-3">
+            <p>Click the visualizer to <span className="text-neutral-200">arm keyboard</span> then play: <span className="text-neutral-200">A W S E D F T G Y H U J K</span></p>
+            <p>Octave shift: <span className="text-neutral-200">{(octaveShift/12)>=0?`+${octaveShift/12}`:`${octaveShift/12}`}</span> (use Z/X)</p>
+            <p>Tip: Raise cutoff & a bit of delay/reverb for ambient vibes.</p>
+          </div>
+        </section>
+      </main>
+
+      <footer className="p-4 text-xs text-neutral-400 border-t border-neutral-800 bg-neutral-950">
+        MVP build. Next steps: chord-detection plants, per-voice filter, presets, recording.
+      </footer>
+
+      {/* Styles */}
+      <StyleBlock accent={ACCENT} />
+    </div>
+  );
+}
+
+// ---------- Piano component ----------
+function Piano({ baseMidi, onDown, onUp }) {
+  // Build two octaves of keys centered around baseMidi
+  const WHITE_PCS = [0,2,4,5,7,9,11];
+  const NO_SHARP_AFTER = new Set([4, 11]); // E and B
+
+  const whites = [];
+  for (let o = -1; o <= 1; o++) {
+    for (let i = 0; i < WHITE_PCS.length; i++) {
+      const pc = WHITE_PCS[i];
+      const midi = baseMidi - (baseMidi % 12) + pc + o * 12; // align to octave grid
+      whites.push({ midi, pc });
+    }
+  }
+
+  const keyW = 36; // white key width in px
+  const keyH = 150; // base height in px
+  const blackW = Math.floor(keyW * 0.6);
+  const blackH = Math.floor(keyH * 0.6);
+  const totalW = whites.length * keyW;
+
+  // Pressed-key feedback
+  const [pressed, setPressed] = React.useState(new Set());
+  const press = (m)=>{ setPressed(s=>{ const n=new Set(s); n.add(m); return n; }); onDown(m); };
+  const release = (m)=>{ setPressed(s=>{ const n=new Set(s); n.delete(m); return n; }); onUp(m); };
+
+  return (
+    <div className="w-full select-none flex justify-center">
+      <div className="relative" style={{ width: totalW + 'px' }}>
+        {/* White keys */}
+        <div className="flex">
+          {whites.map((k) => (
+            <div
+              key={k.midi}
+              onPointerDown={() => press(k.midi)}
+              onPointerUp={() => release(k.midi)}
+              onPointerLeave={() => release(k.midi)}
+              style={{ width: keyW + 'px', height: keyH + 'px' }}
+              className={`relative border border-neutral-400 cursor-pointer ${pressed.has(k.midi) ? 'bg-neutral-300' : 'bg-neutral-200'}`}
+            />
+          ))}
+        </div>
+
+        {/* Black keys overlay */}
+        <div className="pointer-events-none absolute inset-0 z-10">
+          {whites.map((k, i) => {
+            if (NO_SHARP_AFTER.has(k.pc)) return null; // no black key after E or B
+            const blackMidi = k.midi + 1;
+            const left = (i + 1) * keyW - blackW / 2; // centered between this white and the next
+            return (
+              <div
+                key={'b'+blackMidi}
+                onPointerDown={(e) => { e.stopPropagation(); press(blackMidi); }}
+                onPointerUp={(e) => { e.stopPropagation(); release(blackMidi); }}
+                onPointerLeave={(e) => { e.stopPropagation(); release(blackMidi); }}
+                style={{ position:'absolute', left: left + 'px', width: blackW + 'px', height: blackH + 'px' }}
+                className={`pointer-events-auto top-0 border border-neutral-700 rounded-b-md shadow-md ${pressed.has(blackMidi) ? 'bg-neutral-800' : 'bg-neutral-900'}`}
+              />
+            );
+          })}
+        </div>
+        <div className="text-xs text-neutral-400 mt-2">Use Z/X to change octave.</div>
+      </div>
+    </div>
+  );
+}
+
+function Control({ label, children }) {
+  return (
+    <label className="module">
+      <span className="module-label">{label}</span>
+      {children}
+    </label>
+  );
+}
+
+function Group({ title, children }) {
+  return (
+    <section className="flex flex-col gap-3">
+      <h3 className="text-xs tracking-widest uppercase text-neutral-400/90 pl-1">{title}</h3>
+      <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+        {children}
+      </div>
+    </section>
+  );
+}
+
+function Slider({ label, value, min, max, step, onChange }) {
+  return (
+    <label className="flex flex-col gap-1 text-sm">
+      <span className="text-neutral-300 flex justify-between"><span>{label}</span><span className="text-neutral-400">{typeof value === "number" ? value.toFixed(2) : value}</span></span>
+      <input type="range" value={value} min={min} max={max} step={step}
+             onChange={e=>onChange(parseFloat(e.target.value))}
+             className="hw-range" />
+    </label>
+  );
+}
+
+// ---------- Self-tests (dev) ----------
+function runSelfTests() {
+  try {
+    console.assert(typeof CODEMAP.KeyA !== 'undefined', 'CODEMAP missing KeyA');
+    const sr = 44100; const n = 4410; // 0.1s
+    const l = new Float32Array(n); const r = new Float32Array(n);
+    for (let i=0;i<n;i++){ l[i] = Math.sin(2*Math.PI*440*(i/sr)); r[i] = l[i]; }
+    const view = writeWAV(interleave(l,r), sr, 2, 16);
+    console.assert(view.byteLength === 44 + n*2*2, 'WAV size mismatch');
+    const blob = new Blob([view], {type:'audio/wav'});
+    console.assert(blob.size === 44 + n*2*2, 'WAV blob size mismatch');
+    const key = 'hybridSynthPresetsV1';
+    const raw = localStorage.getItem(key);
+    console.assert(!raw || Array.isArray(JSON.parse(raw)), 'Preset storage not array');
+  } catch (e) { console.warn('Self-tests skipped/failed:', e); }
+}
+
+function StyleBlock({ accent = '#ff6a00' }) {
+  return (
+    <style>{`
+      .panel { backdrop-filter: blur(1px); }
+      .module { display:flex; flex-direction:column; gap:6px; padding:10px; border-radius:14px; background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(0,0,0,0.2)); border:1px solid #232323; box-shadow: inset 0 1px 0 rgba(255,255,255,0.05), inset 0 -2px 6px rgba(0,0,0,0.5); }
+      .module-label { font-size:12px; letter-spacing:0.08em; text-transform:uppercase; color:#d1d5db; }
+      .module-readout { font-size:11px; color:#9ca3af; align-self:flex-end; }
+
+      .hw-input { background:#151515; border:1px solid #2b2b2b; border-radius:10px; padding:8px 10px; color:#e5e7eb; outline:none; box-shadow: inset 0 1px 0 rgba(255,255,255,0.04); }
+      .hw-input:focus { border-color:${accent}; box-shadow:0 0 0 2px ${accent}22, inset 0 1px 0 rgba(255,255,255,0.05); }
+
+      .btn { background:#1f1f1f; border:1px solid #2b2b2b; color:#e5e7eb; padding:8px 12px; border-radius:10px; font-size:12px; font-weight:600; box-shadow:0 2px 0 #000, inset 0 1px 0 rgba(255,255,255,0.06); }
+      .btn:hover { filter:brightness(1.05); }
+      .btn:active { transform: translateY(1px); box-shadow:0 1px 0 #000, inset 0 0 0 rgba(255,255,255,0.06); }
+      .btn-ghost { background:#131313; color:#cbd5e1; }
+      .btn-accent { background:${accent}; color:#111827; border-color:#000; }
+      .btn-toggle { background:#2b2b2b; }
+
+      .hw-range { -webkit-appearance:none; width:100%; height:10px; border-radius:8px; background:linear-gradient(180deg, #1b1b1b, #0f0f0f); border:1px solid #2a2a2a; box-shadow: inset 0 1px 0 rgba(255,255,255,0.05); }
+      .hw-range:focus { outline:none; }
+      .hw-range::-webkit-slider-thumb { -webkit-appearance:none; width:18px; height:18px; border-radius:50%; background:${accent}; border:1px solid #000; box-shadow: 0 2px 0 #000, inset 0 1px 0 rgba(255,255,255,0.5); margin-top:-4px; }
+      .hw-range::-moz-range-thumb { width:18px; height:18px; border-radius:50%; background:${accent}; border:1px solid #000; box-shadow: 0 2px 0 #000, inset 0 1px 0 rgba(255,255,255,0.5); }
+      .hw-range::-moz-range-track { background:linear-gradient(180deg, #1b1b1b, #0f0f0f); height:10px; border:1px solid #2a2a2a; border-radius:8px; }
+
+    `}</style>
+  );
+}
